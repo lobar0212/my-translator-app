@@ -44,8 +44,8 @@ async def websocket_endpoint(websocket: WebSocket):
     loop = asyncio.get_running_loop()
 
     if not DEEPGRAM_API_KEY:
-        print("Error: DEEPGRAM_API_KEY is missing from environment variables.")
-        await websocket.close(code=4001, reason="Missing DEEPGRAM_API_KEY in server environment")
+        print("CRITICAL: DEEPGRAM_API_KEY is missing in Render environment variables!")
+        await websocket.close(code=4001, reason="Missing DEEPGRAM_API_KEY in Render environment")
         return
 
     try:
@@ -78,7 +78,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
         options = {
             "model": "nova-2",
-            "language": "multi",
             "smart_format": True,
             "interim_results": False,
             "encoding": "linear16",
@@ -86,10 +85,10 @@ async def websocket_endpoint(websocket: WebSocket):
             "sample_rate": 16000,
         }
 
-        # Start Deepgram Connection inside executor to prevent blocking ASGI event loop
+        # Start Deepgram Connection in an executor thread to prevent blocking Uvicorn/ASGI
         started = await loop.run_in_executor(None, dg_connection.start, options)
         if not started:
-            print("Failed to start Deepgram live connection. Check API key validity or credit balance.")
+            print("CRITICAL: Deepgram API rejected connection. Check API key or account balance.")
             await websocket.close(code=4002, reason="Deepgram Rejected Connection (Invalid Key or Out of Credits)")
             return
 
@@ -98,14 +97,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = await websocket.receive_bytes()
                 dg_connection.send(data)
         except WebSocketDisconnect:
-            print("WebSocket disconnected cleanly.")
+            print("WebSocket disconnected cleanly by user.")
         except Exception as e:
             print(f"WebSocket send loop error: {e}")
         finally:
             await loop.run_in_executor(None, dg_connection.finish)
 
     except Exception as e:
-        print(f"ASGI Application Exception in WebSocket: {e}\n{traceback.format_exc()}")
+        print(f"EXACT BACKEND ERROR: {e}\n{traceback.format_exc()}")
         await websocket.close(code=4003, reason="Internal Server Error")
 
 
@@ -173,7 +172,9 @@ async def get_client():
                             if (e.code === 4001) {
                                 setStatus("Server Error: Missing DEEPGRAM_API_KEY on Render.");
                             } else if (e.code === 4002) {
-                                setStatus("Server Error: Deepgram rejected connection (Invalid Key/No Credits).");
+                                setStatus("Server Error: Deepgram rejected connection (Invalid Key or Out of Credits).");
+                            } else if (e.code === 4003) {
+                                setStatus("Server Error: Internal Python Exception occurred on backend.");
                             } else if (e.code === 1005) {
                                 setStatus("Disconnected: Audio sharing was stopped or unselected.");
                             } else {
@@ -195,7 +196,7 @@ async def get_client():
                             }
                         };
 
-                        // Capture system audio
+                        // Request system/tab audio capture
                         stream = await navigator.mediaDevices.getDisplayMedia({
                             video: true,
                             audio: {
@@ -213,7 +214,7 @@ async def get_client():
                             return;
                         }
 
-                        // Stop translating automatically if user clicks browser "Stop Sharing" bar
+                        // Handle browser 'Stop Sharing' bar click
                         audioTrack.onended = () => {
                             if (active) resetUI();
                         };
