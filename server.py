@@ -45,7 +45,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     if not DEEPGRAM_API_KEY:
         print("Error: DEEPGRAM_API_KEY is missing from environment variables.")
-        await websocket.close(code=1008, reason="Missing API Key")
+        await websocket.close(code=4001, reason="Missing DEEPGRAM_API_KEY in server environment")
         return
 
     try:
@@ -89,8 +89,8 @@ async def websocket_endpoint(websocket: WebSocket):
         # Start Deepgram Connection inside executor to prevent blocking ASGI event loop
         started = await loop.run_in_executor(None, dg_connection.start, options)
         if not started:
-            print("Failed to start Deepgram live connection.")
-            await websocket.close(code=1011, reason="Deepgram Connection Failed")
+            print("Failed to start Deepgram live connection. Check API key validity or credit balance.")
+            await websocket.close(code=4002, reason="Deepgram Rejected Connection (Invalid Key or Out of Credits)")
             return
 
         try:
@@ -105,9 +105,8 @@ async def websocket_endpoint(websocket: WebSocket):
             await loop.run_in_executor(None, dg_connection.finish)
 
     except Exception as e:
-        print(f"ASGI Application Exception in WebSocket: {e}")
-        print(traceback.format_exc())
-        await websocket.close(code=1011)
+        print(f"ASGI Application Exception in WebSocket: {e}\n{traceback.format_exc()}")
+        await websocket.close(code=4003, reason="Internal Server Error")
 
 
 @app.get("/")
@@ -127,7 +126,7 @@ async def get_client():
             #ru-box { border-color: #d9534f; }
             p { font-size: 17px; line-height: 1.4; margin: 0; }
             button { width: 100%; padding: 16px; font-size: 18px; font-weight: bold; background: #28a745; color: white; border: none; border-radius: 12px; cursor: pointer; }
-            #status { font-size: 13px; color: #888; text-align: center; margin-top: 6px; }
+            #status { font-size: 13px; color: #aaa; text-align: center; margin-top: 8px; font-weight: 500; }
         </style>
     </head>
     <body>
@@ -167,9 +166,23 @@ async def get_client():
                         const protocol = location.protocol === "https:" ? "wss:" : "ws:";
                         socket = new WebSocket(`${protocol}//${location.host}/ws`);
 
-                        socket.onopen = () => setStatus("Connected to Server. Streaming System Audio...");
-                        socket.onclose = (e) => setStatus(`Disconnected (Code: ${e.code})`);
-                        socket.onerror = (e) => setStatus("WebSocket Error");
+                        socket.onopen = () => setStatus("Connected to Server. Listening to System Audio...");
+                        
+                        socket.onclose = (e) => {
+                            let reason = e.reason ? ` (${e.reason})` : '';
+                            if (e.code === 4001) {
+                                setStatus("Server Error: Missing DEEPGRAM_API_KEY on Render.");
+                            } else if (e.code === 4002) {
+                                setStatus("Server Error: Deepgram rejected connection (Invalid Key/No Credits).");
+                            } else if (e.code === 1005) {
+                                setStatus("Disconnected: Audio sharing was stopped or unselected.");
+                            } else {
+                                setStatus(`Disconnected (Code: ${e.code}${reason})`);
+                            }
+                            if (active) resetUI();
+                        };
+
+                        socket.onerror = (e) => setStatus("WebSocket Connection Error.");
 
                         socket.onmessage = (e) => {
                             const data = JSON.parse(e.data);
@@ -182,6 +195,7 @@ async def get_client():
                             }
                         };
 
+                        // Capture system audio
                         stream = await navigator.mediaDevices.getDisplayMedia({
                             video: true,
                             audio: {
@@ -193,11 +207,16 @@ async def get_client():
 
                         const audioTrack = stream.getAudioTracks()[0];
                         if (!audioTrack) {
-                            alert("Important: You must check 'Share tab audio' or 'Share system audio' in the popup window!");
+                            alert("You did not check 'Share tab audio' or 'Share system audio' in the browser window!");
                             stream.getTracks().forEach(t => t.stop());
-                            socket.close();
+                            if (socket) socket.close(1000, "Audio unselected");
                             return;
                         }
+
+                        // Stop translating automatically if user clicks browser "Stop Sharing" bar
+                        audioTrack.onended = () => {
+                            if (active) resetUI();
+                        };
 
                         audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                         await audioCtx.resume();
@@ -218,7 +237,7 @@ async def get_client():
                             }
                         };
 
-                        btn.innerText = "⏹ STOP TRANSLATING";
+                        btn.innerText = "⏹ STOP TRANSLATING SYSTEM AUDIO";
                         btn.style.background = "#dc3545";
                         active = true;
                     } catch (err) {
@@ -226,15 +245,19 @@ async def get_client():
                         setStatus("Failed to access system audio.");
                     }
                 } else {
-                    if (processor) processor.disconnect();
-                    if (stream) stream.getTracks().forEach(t => t.stop());
-                    if (socket) socket.close();
-                    if (audioCtx) audioCtx.close();
-                    btn.innerText = "▶ START TRANSLATING SYSTEM AUDIO";
-                    btn.style.background = "#28a745";
-                    setStatus("Stopped.");
-                    active = false;
+                    resetUI();
                 }
+            }
+
+            function resetUI() {
+                const btn = document.getElementById("btn");
+                if (processor) processor.disconnect();
+                if (stream) stream.getTracks().forEach(t => t.stop());
+                if (socket) socket.close();
+                if (audioCtx) audioCtx.close();
+                btn.innerText = "▶ START TRANSLATING SYSTEM AUDIO";
+                btn.style.background = "#28a745";
+                active = false;
             }
         </script>
     </body>
