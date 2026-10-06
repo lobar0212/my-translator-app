@@ -4,10 +4,12 @@ import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import deepl
-from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
+from deepgram import DeepgramClient, LiveOptions
 
+# Environment variables
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
+DEEPL_GLOSSARY_ID = os.getenv("DEEPL_GLOSSARY_ID")
 
 app = FastAPI()
 deepl_translator = deepl.DeepLClient(DEEPL_API_KEY) if DEEPL_API_KEY else None
@@ -17,7 +19,12 @@ def translate_text(text: str, source_lang: str) -> dict:
         return None
     try:
         target_lang = "EN-US" if source_lang.lower().startswith("ru") else "RU"
-        result = deepl_translator.translate_text(text, target_lang=target_lang)
+        kwargs = {"target_lang": target_lang}
+        
+        if target_lang == "RU" and DEEPL_GLOSSARY_ID:
+            kwargs["glossary"] = DEEPL_GLOSSARY_ID
+
+        result = deepl_translator.translate_text(text, **kwargs)
         return {
             "source_lang": source_lang,
             "target_lang": target_lang,
@@ -34,7 +41,7 @@ async def websocket_endpoint(websocket: WebSocket):
     loop = asyncio.get_running_loop()
 
     deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-    dg_connection = deepgram.listen.live.v("1")
+    dg_connection = deepgram.listen.websocket.v("1")
 
     def on_message(self, result, **kwargs):
         sentence = result.channel.alternatives[0].transcript.strip()
@@ -52,7 +59,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             asyncio.run_coroutine_threadsafe(send_payload(), loop)
 
-    dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+    dg_connection.on("Transcript", on_message)
 
     options = LiveOptions(
         model="nova-2",
