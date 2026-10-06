@@ -4,7 +4,8 @@ import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import deepl
-from deepgram import DeepgramClient, LiveOptions
+from deepgram import DeepgramClient
+from deepgram.clients.live.v1 import LiveOptions, LiveTranscriptionEvents
 
 # Environment variables
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
@@ -14,13 +15,14 @@ DEEPL_GLOSSARY_ID = os.getenv("DEEPL_GLOSSARY_ID")
 app = FastAPI()
 deepl_translator = deepl.DeepLClient(DEEPL_API_KEY) if DEEPL_API_KEY else None
 
+
 def translate_text(text: str, source_lang: str) -> dict:
     if not deepl_translator:
         return None
     try:
         target_lang = "EN-US" if source_lang.lower().startswith("ru") else "RU"
         kwargs = {"target_lang": target_lang}
-        
+
         if target_lang == "RU" and DEEPL_GLOSSARY_ID:
             kwargs["glossary"] = DEEPL_GLOSSARY_ID
 
@@ -29,11 +31,12 @@ def translate_text(text: str, source_lang: str) -> dict:
             "source_lang": source_lang,
             "target_lang": target_lang,
             "original_text": text,
-            "translated_text": result.text
+            "translated_text": result.text,
         }
     except Exception as e:
         print(f"Translation Error: {e}")
         return None
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -46,12 +49,16 @@ async def websocket_endpoint(websocket: WebSocket):
     def on_message(self, result, **kwargs):
         sentence = result.channel.alternatives[0].transcript.strip()
         if sentence and result.is_final:
-            detected_lang = result.channel.alternatives[0].languages[0] if result.channel.alternatives[0].languages else "en"
-            
+            detected_lang = (
+                result.channel.alternatives[0].languages[0]
+                if result.channel.alternatives[0].languages
+                else "en"
+            )
+
             translation_payload = loop.run_in_executor(
                 None, translate_text, sentence, detected_lang
             )
-            
+
             async def send_payload():
                 payload = await translation_payload
                 if payload:
@@ -59,7 +66,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             asyncio.run_coroutine_threadsafe(send_payload(), loop)
 
-    dg_connection.on("Transcript", on_message)
+    dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
     options = LiveOptions(
         model="nova-2",
@@ -68,7 +75,7 @@ async def websocket_endpoint(websocket: WebSocket):
         interim_results=False,
         encoding="linear16",
         channels=1,
-        sample_rate=16000
+        sample_rate=16000,
     )
 
     if not dg_connection.start(options):
@@ -83,6 +90,7 @@ async def websocket_endpoint(websocket: WebSocket):
         pass
     finally:
         dg_connection.finish()
+
 
 @app.get("/")
 async def get_client():
