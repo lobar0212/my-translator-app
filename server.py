@@ -17,7 +17,7 @@ deepl_translator = deepl.DeepLClient(DEEPL_API_KEY) if DEEPL_API_KEY else None
 
 def translate_text(text: str, source_lang: str) -> dict:
     if not deepl_translator:
-        return None
+        return {"source_lang": source_lang, "target_lang": "EN", "original_text": text, "translated_text": text}
     try:
         target_lang = "EN-US" if source_lang.lower().startswith("ru") else "RU"
         kwargs = {"target_lang": target_lang}
@@ -34,13 +34,18 @@ def translate_text(text: str, source_lang: str) -> dict:
         }
     except Exception as e:
         print(f"Translation Error: {e}")
-        return None
+        return {"source_lang": source_lang, "target_lang": "EN", "original_text": text, "translated_text": text}
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     loop = asyncio.get_running_loop()
+
+    if not DEEPGRAM_API_KEY:
+        print("Error: DEEPGRAM_API_KEY is missing from environment variables.")
+        await websocket.close(code=1008, reason="Missing API Key")
+        return
 
     deepgram = DeepgramClient(DEEPGRAM_API_KEY)
     dg_connection = deepgram.listen.websocket.v("1")
@@ -59,17 +64,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
                 async def process_and_send(text, lang):
-                    payload = await loop.run_in_executor(
-                        None, translate_text, text, lang
-                    )
+                    payload = await loop.run_in_executor(None, translate_text, text, lang)
                     if payload:
                         await websocket.send_text(json.dumps(payload))
 
-                asyncio.run_coroutine_threadsafe(
-                    process_and_send(sentence, detected_lang), loop
-                )
+                asyncio.run_coroutine_threadsafe(process_and_send(sentence, detected_lang), loop)
         except Exception as e:
-            print(f"Error handling message: {e}")
+            print(f"Error handling transcription: {e}")
 
     dg_connection.on("Results", on_message)
 
@@ -84,7 +85,7 @@ async def websocket_endpoint(websocket: WebSocket):
     }
 
     if not dg_connection.start(options):
-        print("Failed to start Deepgram connection.")
+        print("Failed to start Deepgram live connection.")
         await websocket.close()
         return
 
@@ -93,7 +94,7 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_bytes()
             dg_connection.send(data)
     except WebSocketDisconnect:
-        print("WebSocket disconnected")
+        print("WebSocket disconnected cleanly.")
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
@@ -116,11 +117,13 @@ async def get_client():
             #en-box { border-color: #007acc; }
             #ru-box { border-color: #d9534f; }
             p { font-size: 17px; line-height: 1.4; margin: 0; }
-            button { width: 100%; padding: 16px; font-size: 18px; font-weight: bold; background: #28a745; color: white; border: none; border-radius: 12px; }
+            button { width: 100%; padding: 16px; font-size: 18px; font-weight: bold; background: #28a745; color: white; border: none; border-radius: 12px; cursor: pointer; }
+            #status { font-size: 13px; color: #888; text-align: center; margin-top: 6px; }
         </style>
     </head>
     <body>
-        <button id="btn" onclick="toggle()">▶ START TRANSLATING</button>
+        <button id="btn" onclick="toggle()">▶ START TRANSLATING SYSTEM AUDIO</button>
+        <div id="status">Status: Idle</div>
         <div style="margin-top:12px;">
             <div id="en-box" class="box">
                 <h2>ENGLISH SUBTITLES (MAX 100 WORDS)</h2>
@@ -139,59 +142,89 @@ async def get_client():
                 let current = el.innerText.trim().split(/\\s+/).filter(Boolean);
                 let incoming = text.trim().split(/\\s+/).filter(Boolean);
                 let merged = [...current, ...incoming];
-                
                 if (merged.length > 100) merged = merged.slice(merged.length - 100);
-                
                 el.innerText = merged.join(" ");
                 el.parentElement.scrollTop = el.parentElement.scrollHeight;
+            }
+
+            function setStatus(msg) {
+                document.getElementById("status").innerText = "Status: " + msg;
             }
 
             async function toggle() {
                 const btn = document.getElementById("btn");
                 if (!active) {
-                    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-                    socket = new WebSocket(`${protocol}//${location.host}/ws`);
+                    try {
+                        const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+                        socket = new WebSocket(`${protocol}//${location.host}/ws`);
 
-                    socket.onmessage = (e) => {
-                        const data = JSON.parse(e.data);
-                        if (data.target_lang.startsWith("EN")) {
-                            addWords("en-text", data.translated_text);
-                            addWords("ru-text", `[Orig]: ${data.original_text}`);
-                        } else {
-                            addWords("ru-text", data.translated_text);
-                            addWords("en-text", `[Orig]: ${data.original_text}`);
-                        }
-                    };
+                        socket.onopen = () => setStatus("Connected to Server. Streaming System Audio...");
+                        socket.onclose = (e) => setStatus(`Disconnected (Code: ${e.code})`);
+                        socket.onerror = (e) => setStatus("WebSocket Error");
 
-                    socket.onerror = (err) => console.error("WebSocket Error:", err);
-
-                    stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
-                    audioCtx = new AudioContext({ sampleRate: 16000 });
-                    const src = audioCtx.createMediaStreamSource(stream);
-                    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-                    src.connect(processor);
-                    processor.connect(audioCtx.destination);
-
-                    processor.onaudioprocess = (e) => {
-                        if (socket && socket.readyState === 1) {
-                            const float32 = e.inputBuffer.getChannelData(0);
-                            const int16 = new Int16Array(float32.length);
-                            for (let i = 0; i < float32.length; i++) {
-                                int16[i] = Math.max(-1, Math.min(1, float32[i])) * 0x7FFF;
+                        socket.onmessage = (e) => {
+                            const data = JSON.parse(e.data);
+                            if (data.target_lang.startsWith("EN")) {
+                                addWords("en-text", data.translated_text);
+                                addWords("ru-text", `[Orig]: ${data.original_text}`);
+                            } else {
+                                addWords("ru-text", data.translated_text);
+                                addWords("en-text", `[Orig]: ${data.original_text}`);
                             }
-                            socket.send(int16.buffer);
-                        }
-                    };
+                        };
 
-                    btn.innerText = "⏹ STOP";
-                    btn.style.background = "#dc3545";
-                    active = true;
+                        // Request system audio output instead of mic
+                        stream = await navigator.mediaDevices.getDisplayMedia({
+                            video: true,
+                            audio: {
+                                echoCancellation: false,
+                                noiseSuppression: false,
+                                autoGainControl: false
+                            }
+                        });
+
+                        const audioTrack = stream.getAudioTracks()[0];
+                        if (!audioTrack) {
+                            alert("Important: You must check 'Share tab audio' or 'Share system audio' in the popup window!");
+                            stream.getTracks().forEach(t => t.stop());
+                            socket.close();
+                            return;
+                        }
+
+                        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                        await audioCtx.resume();
+
+                        const src = audioCtx.createMediaStreamSource(stream);
+                        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+                        src.connect(processor);
+                        processor.connect(audioCtx.destination);
+
+                        processor.onaudioprocess = (e) => {
+                            if (socket && socket.readyState === 1) {
+                                const float32 = e.inputBuffer.getChannelData(0);
+                                const int16 = new Int16Array(float32.length);
+                                for (let i = 0; i < float32.length; i++) {
+                                    int16[i] = Math.max(-1, Math.min(1, float32[i])) * 0x7FFF;
+                                }
+                                socket.send(int16.buffer);
+                            }
+                        };
+
+                        btn.innerText = "⏹ STOP TRANSLATING";
+                        btn.style.background = "#dc3545";
+                        active = true;
+                    } catch (err) {
+                        alert("Audio Sharing Error: " + err.message);
+                        setStatus("Failed to access system audio.");
+                    }
                 } else {
                     if (processor) processor.disconnect();
                     if (stream) stream.getTracks().forEach(t => t.stop());
                     if (socket) socket.close();
-                    btn.innerText = "▶ START TRANSLATING";
+                    if (audioCtx) audioCtx.close();
+                    btn.innerText = "▶ START TRANSLATING SYSTEM AUDIO";
                     btn.style.background = "#28a745";
+                    setStatus("Stopped.");
                     active = false;
                 }
             }
