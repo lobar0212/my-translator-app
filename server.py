@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import deepl
@@ -47,58 +48,66 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008, reason="Missing API Key")
         return
 
-    deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-    dg_connection = deepgram.listen.websocket.v("1")
-
-    def on_message(self, result, **kwargs):
-        try:
-            if not result.channel or not result.channel.alternatives:
-                return
-            
-            sentence = result.channel.alternatives[0].transcript.strip()
-            if sentence and result.is_final:
-                detected_lang = (
-                    result.channel.alternatives[0].languages[0]
-                    if getattr(result.channel.alternatives[0], "languages", None)
-                    else "en"
-                )
-
-                async def process_and_send(text, lang):
-                    payload = await loop.run_in_executor(None, translate_text, text, lang)
-                    if payload:
-                        await websocket.send_text(json.dumps(payload))
-
-                asyncio.run_coroutine_threadsafe(process_and_send(sentence, detected_lang), loop)
-        except Exception as e:
-            print(f"Error handling transcription: {e}")
-
-    dg_connection.on("Results", on_message)
-
-    options = {
-        "model": "nova-2",
-        "language": "multi",
-        "smart_format": True,
-        "interim_results": False,
-        "encoding": "linear16",
-        "channels": 1,
-        "sample_rate": 16000,
-    }
-
-    if not dg_connection.start(options):
-        print("Failed to start Deepgram live connection.")
-        await websocket.close()
-        return
-
     try:
-        while True:
-            data = await websocket.receive_bytes()
-            dg_connection.send(data)
-    except WebSocketDisconnect:
-        print("WebSocket disconnected cleanly.")
+        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
+        dg_connection = deepgram.listen.websocket.v("1")
+
+        def on_message(self, result, **kwargs):
+            try:
+                if not result.channel or not result.channel.alternatives:
+                    return
+                
+                sentence = result.channel.alternatives[0].transcript.strip()
+                if sentence and result.is_final:
+                    detected_lang = (
+                        result.channel.alternatives[0].languages[0]
+                        if getattr(result.channel.alternatives[0], "languages", None)
+                        else "en"
+                    )
+
+                    async def process_and_send(text, lang):
+                        payload = await loop.run_in_executor(None, translate_text, text, lang)
+                        if payload:
+                            await websocket.send_text(json.dumps(payload))
+
+                    asyncio.run_coroutine_threadsafe(process_and_send(sentence, detected_lang), loop)
+            except Exception as e:
+                print(f"Error handling transcription: {e}\n{traceback.format_exc()}")
+
+        dg_connection.on("Results", on_message)
+
+        options = {
+            "model": "nova-2",
+            "language": "multi",
+            "smart_format": True,
+            "interim_results": False,
+            "encoding": "linear16",
+            "channels": 1,
+            "sample_rate": 16000,
+        }
+
+        # Start Deepgram Connection inside executor to prevent blocking ASGI event loop
+        started = await loop.run_in_executor(None, dg_connection.start, options)
+        if not started:
+            print("Failed to start Deepgram live connection.")
+            await websocket.close(code=1011, reason="Deepgram Connection Failed")
+            return
+
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                dg_connection.send(data)
+        except WebSocketDisconnect:
+            print("WebSocket disconnected cleanly.")
+        except Exception as e:
+            print(f"WebSocket send loop error: {e}")
+        finally:
+            await loop.run_in_executor(None, dg_connection.finish)
+
     except Exception as e:
-        print(f"WebSocket error: {e}")
-    finally:
-        dg_connection.finish()
+        print(f"ASGI Application Exception in WebSocket: {e}")
+        print(traceback.format_exc())
+        await websocket.close(code=1011)
 
 
 @app.get("/")
@@ -173,7 +182,6 @@ async def get_client():
                             }
                         };
 
-                        // Request system audio output instead of mic
                         stream = await navigator.mediaDevices.getDisplayMedia({
                             video: true,
                             audio: {
