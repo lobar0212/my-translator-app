@@ -45,7 +45,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     if not DEEPGRAM_API_KEY:
         print("CRITICAL: DEEPGRAM_API_KEY is missing in Render environment variables!")
-        await websocket.close(code=4001, reason="Missing DEEPGRAM_API_KEY in Render environment")
+        await websocket.close(code=4001, reason="Missing DEEPGRAM_API_KEY")
         return
 
     try:
@@ -85,11 +85,10 @@ async def websocket_endpoint(websocket: WebSocket):
             "sample_rate": 16000,
         }
 
-        # Start Deepgram Connection in an executor thread to prevent blocking Uvicorn/ASGI
         started = await loop.run_in_executor(None, dg_connection.start, options)
         if not started:
             print("CRITICAL: Deepgram API rejected connection. Check API key or account balance.")
-            await websocket.close(code=4002, reason="Deepgram Rejected Connection (Invalid Key or Out of Credits)")
+            await websocket.close(code=4002, reason="Deepgram Rejected Connection")
             return
 
         try:
@@ -97,7 +96,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = await websocket.receive_bytes()
                 dg_connection.send(data)
         except WebSocketDisconnect:
-            print("WebSocket disconnected cleanly by user.")
+            print("WebSocket disconnected cleanly.")
         except Exception as e:
             print(f"WebSocket send loop error: {e}")
         finally:
@@ -158,6 +157,28 @@ async def get_client():
                 document.getElementById("status").innerText = "Status: " + msg;
             }
 
+            function downsampleBuffer(buffer, sampleRate, outSampleRate) {
+                if (outSampleRate === sampleRate) return buffer;
+                if (outSampleRate > sampleRate) throw "outSampleRate must be rate-limiting";
+                let sampleRateRatio = sampleRate / outSampleRate;
+                let newLength = Math.round(buffer.length / sampleRateRatio);
+                let result = new Float32Array(newLength);
+                let offsetResult = 0;
+                let offsetBuffer = 0;
+                while (offsetResult < result.length) {
+                    let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                    let accum = 0, count = 0;
+                    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                        accum += buffer[i];
+                        count++;
+                    }
+                    result[offsetResult] = accum / count;
+                    offsetResult++;
+                    offsetBuffer = nextOffsetBuffer;
+                }
+                return result;
+            }
+
             async function toggle() {
                 const btn = document.getElementById("btn");
                 if (!active) {
@@ -169,21 +190,14 @@ async def get_client():
                         
                         socket.onclose = (e) => {
                             let reason = e.reason ? ` (${e.reason})` : '';
-                            if (e.code === 4001) {
-                                setStatus("Server Error: Missing DEEPGRAM_API_KEY on Render.");
-                            } else if (e.code === 4002) {
-                                setStatus("Server Error: Deepgram rejected connection (Invalid Key or Out of Credits).");
-                            } else if (e.code === 4003) {
-                                setStatus("Server Error: Internal Python Exception occurred on backend.");
-                            } else if (e.code === 1005) {
-                                setStatus("Disconnected: Audio sharing was stopped or unselected.");
-                            } else {
-                                setStatus(`Disconnected (Code: ${e.code}${reason})`);
-                            }
+                            if (e.code === 4001) setStatus("Server Error: Missing DEEPGRAM_API_KEY.");
+                            else if (e.code === 4002) setStatus("Server Error: Deepgram rejected connection.");
+                            else if (e.code === 4003) setStatus("Server Error: Internal Exception.");
+                            else setStatus(`Disconnected (Code: ${e.code}${reason})`);
                             if (active) resetUI();
                         };
 
-                        socket.onerror = (e) => setStatus("WebSocket Connection Error.");
+                        socket.onerror = () => setStatus("WebSocket Connection Error.");
 
                         socket.onmessage = (e) => {
                             const data = JSON.parse(e.data);
@@ -196,30 +210,26 @@ async def get_client():
                             }
                         };
 
-                        // Request system/tab audio capture
+                        // Request system audio
                         stream = await navigator.mediaDevices.getDisplayMedia({
                             video: true,
-                            audio: {
-                                echoCancellation: false,
-                                noiseSuppression: false,
-                                autoGainControl: false
-                            }
+                            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
                         });
 
                         const audioTrack = stream.getAudioTracks()[0];
                         if (!audioTrack) {
-                            alert("You did not check 'Share tab audio' or 'Share system audio' in the browser window!");
+                            alert("Audio track missing from captured stream.");
                             stream.getTracks().forEach(t => t.stop());
                             if (socket) socket.close(1000, "Audio unselected");
                             return;
                         }
 
-                        // Handle browser 'Stop Sharing' bar click
                         audioTrack.onended = () => {
-                            if (active) resetUI();
+                            if (active) setStatus("Browser stopped sending audio track.");
                         };
 
-                        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                        // Use browser native sample rate and resample in JS to avoid sampleRate rejection
+                        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                         await audioCtx.resume();
 
                         const src = audioCtx.createMediaStreamSource(stream);
@@ -229,10 +239,11 @@ async def get_client():
 
                         processor.onaudioprocess = (e) => {
                             if (socket && socket.readyState === 1) {
-                                const float32 = e.inputBuffer.getChannelData(0);
-                                const int16 = new Int16Array(float32.length);
-                                for (let i = 0; i < float32.length; i++) {
-                                    int16[i] = Math.max(-1, Math.min(1, float32[i])) * 0x7FFF;
+                                const float32Input = e.inputBuffer.getChannelData(0);
+                                const resampled = downsampleBuffer(float32Input, audioCtx.sampleRate, 16000);
+                                const int16 = new Int16Array(resampled.length);
+                                for (let i = 0; i < resampled.length; i++) {
+                                    int16[i] = Math.max(-1, Math.min(1, resampled[i])) * 0x7FFF;
                                 }
                                 socket.send(int16.buffer);
                             }
@@ -242,7 +253,7 @@ async def get_client():
                         btn.style.background = "#dc3545";
                         active = true;
                     } catch (err) {
-                        alert("Audio Sharing Error: " + err.message);
+                        alert("Audio Capture Error: " + err.message);
                         setStatus("Failed to access system audio.");
                     }
                 } else {
