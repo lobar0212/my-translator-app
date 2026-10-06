@@ -5,7 +5,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import deepl
 from deepgram import DeepgramClient
-from deepgram.clients.live.v1 import LiveOptions, LiveTranscriptionEvents
 
 # Environment variables
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
@@ -66,17 +65,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
             asyncio.run_coroutine_threadsafe(send_payload(), loop)
 
-    dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+    # Attach listener using string event name to avoid importing LiveTranscriptionEvents
+    dg_connection.on("Results", on_message)
 
-    options = LiveOptions(
-        model="nova-2",
-        language="multi",
-        smart_format=True,
-        interim_results=False,
-        encoding="linear16",
-        channels=1,
-        sample_rate=16000,
-    )
+    # Use a raw dictionary for options to avoid importing LiveOptions
+    options = {
+        "model": "nova-2",
+        "language": "multi",
+        "smart_format": True,
+        "interim_results": False,
+        "encoding": "linear16",
+        "channels": 1,
+        "sample_rate": 16000,
+    }
 
     if not dg_connection.start(options):
         await websocket.close()
