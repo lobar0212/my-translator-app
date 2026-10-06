@@ -46,29 +46,33 @@ async def websocket_endpoint(websocket: WebSocket):
     dg_connection = deepgram.listen.websocket.v("1")
 
     def on_message(self, result, **kwargs):
-        sentence = result.channel.alternatives[0].transcript.strip()
-        if sentence and result.is_final:
-            detected_lang = (
-                result.channel.alternatives[0].languages[0]
-                if result.channel.alternatives[0].languages
-                else "en"
-            )
+        try:
+            if not result.channel or not result.channel.alternatives:
+                return
+            
+            sentence = result.channel.alternatives[0].transcript.strip()
+            if sentence and result.is_final:
+                detected_lang = (
+                    result.channel.alternatives[0].languages[0]
+                    if getattr(result.channel.alternatives[0], "languages", None)
+                    else "en"
+                )
 
-            translation_payload = loop.run_in_executor(
-                None, translate_text, sentence, detected_lang
-            )
+                async def process_and_send(text, lang):
+                    payload = await loop.run_in_executor(
+                        None, translate_text, text, lang
+                    )
+                    if payload:
+                        await websocket.send_text(json.dumps(payload))
 
-            async def send_payload():
-                payload = await translation_payload
-                if payload:
-                    await websocket.send_text(json.dumps(payload))
+                asyncio.run_coroutine_threadsafe(
+                    process_and_send(sentence, detected_lang), loop
+                )
+        except Exception as e:
+            print(f"Error handling message: {e}")
 
-            asyncio.run_coroutine_threadsafe(send_payload(), loop)
-
-    # Attach listener using string event name to avoid importing LiveTranscriptionEvents
     dg_connection.on("Results", on_message)
 
-    # Use a raw dictionary for options to avoid importing LiveOptions
     options = {
         "model": "nova-2",
         "language": "multi",
@@ -80,6 +84,7 @@ async def websocket_endpoint(websocket: WebSocket):
     }
 
     if not dg_connection.start(options):
+        print("Failed to start Deepgram connection.")
         await websocket.close()
         return
 
@@ -88,7 +93,9 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_bytes()
             dg_connection.send(data)
     except WebSocketDisconnect:
-        pass
+        print("WebSocket disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
     finally:
         dg_connection.finish()
 
@@ -155,6 +162,8 @@ async def get_client():
                             addWords("en-text", `[Orig]: ${data.original_text}`);
                         }
                     };
+
+                    socket.onerror = (err) => console.error("WebSocket Error:", err);
 
                     stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
                     audioCtx = new AudioContext({ sampleRate: 16000 });
